@@ -24,21 +24,14 @@ func (v QueryViolation) String() string {
 	)
 }
 
-// CheckQueries parses all .sql files in queriesDir and reports cross-BC table references.
-func CheckQueries(queriesDir string, idx TableIndex) ([]QueryViolation, []error) {
-	files, err := filepath.Glob(filepath.Join(queriesDir, "*.sql"))
-	if err != nil {
-		return nil, []error{fmt.Errorf("listing query files: %w", err)}
-	}
-	if len(files) == 0 {
-		return nil, []error{fmt.Errorf("no .sql files found in %s", queriesDir)}
-	}
-
+// CheckQueryFiles parses the given query files and reports cross-BC table references.
+// The context is the owning bounded context for all queries in these files.
+func CheckQueryFiles(files []string, context string, idx TableIndex) ([]QueryViolation, []error) {
 	var violations []QueryViolation
 	var errs []error
 
 	for _, file := range files {
-		v, e := checkQueryFile(file, idx)
+		v, e := checkQueryFile(file, context, idx)
 		violations = append(violations, v...)
 		errs = append(errs, e...)
 	}
@@ -46,13 +39,12 @@ func CheckQueries(queriesDir string, idx TableIndex) ([]QueryViolation, []error)
 	return violations, errs
 }
 
-func checkQueryFile(file string, idx TableIndex) ([]QueryViolation, []error) {
+func checkQueryFile(file string, queryCtx string, idx TableIndex) ([]QueryViolation, []error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil, []error{fmt.Errorf("reading %s: %w", file, err)}
 	}
 
-	// Parse to protobuf AST, then marshal to JSON for easy recursive walking.
 	result, err := pg_query.Parse(string(data))
 	if err != nil {
 		return nil, []error{fmt.Errorf("parsing %s: %w", file, err)}
@@ -69,17 +61,13 @@ func checkQueryFile(file string, idx TableIndex) ([]QueryViolation, []error) {
 	}
 
 	relFile := filepath.Base(file)
-	queryCtx := ContextFromFile(file)
 
-	// First collect CTE names so we can exclude them from table references.
 	cteNames := make(map[string]bool)
 	collectCTENames(tree, cteNames)
 
-	// Collect all unique table names referenced in RangeVar nodes.
 	tables := make(map[string]bool)
 	collectRangeVarNames(tree, tables)
 
-	// Remove CTE aliases — they appear as RangeVar references but are not real tables.
 	for name := range cteNames {
 		delete(tables, name)
 	}
@@ -90,7 +78,7 @@ func checkQueryFile(file string, idx TableIndex) ([]QueryViolation, []error) {
 	for table := range tables {
 		owner, ok := idx.OwnerOf(table)
 		if !ok {
-			errs = append(errs, fmt.Errorf("%s: table %q is not declared in table_ownership", relFile, table))
+			errs = append(errs, fmt.Errorf("%s: table %q is not found in any context schema", relFile, table))
 			continue
 		}
 
@@ -136,7 +124,6 @@ func collectCTENames(node interface{}, names map[string]bool) {
 func collectRangeVarNames(node interface{}, tables map[string]bool) {
 	switch v := node.(type) {
 	case map[string]interface{}:
-		// If this object has a "RangeVar" key, extract the relname.
 		if rv, ok := v["RangeVar"]; ok {
 			if rvMap, ok := rv.(map[string]interface{}); ok {
 				if relname, ok := rvMap["relname"].(string); ok && relname != "" {
@@ -144,7 +131,6 @@ func collectRangeVarNames(node interface{}, tables map[string]bool) {
 				}
 			}
 		}
-		// Recurse into all values.
 		for _, val := range v {
 			collectRangeVarNames(val, tables)
 		}

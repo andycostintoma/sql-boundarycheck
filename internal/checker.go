@@ -29,22 +29,48 @@ func Run(root, configPath string) Result {
 		return Result{Errors: []error{err}}
 	}
 
-	idx, err := BuildTableIndex(cfg)
-	if err != nil {
-		return Result{Errors: []error{err}}
-	}
-
 	var result Result
 
-	schemaDir := filepath.Join(root, cfg.SchemaDir)
-	sv, se := CheckSchema(schemaDir, idx)
-	result.SchemaViolations = sv
-	result.Errors = append(result.Errors, se...)
+	// Phase 1: Discover all tables from schema files to build the index.
+	idx := NewTableIndex()
+	for ctxName, ctxCfg := range cfg.Contexts {
+		files, err := ResolveSQLFiles(root, ctxCfg.Schema)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("context %q schema: %w", ctxName, err))
+			continue
+		}
+		errs := DiscoverTables(files, ctxName, idx)
+		result.Errors = append(result.Errors, errs...)
+	}
 
-	queriesDir := filepath.Join(root, cfg.QueriesDir)
-	qv, qe := CheckQueries(queriesDir, idx)
-	result.QueryViolations = qv
-	result.Errors = append(result.Errors, qe...)
+	// If there were table discovery errors, still proceed with what we have.
+
+	// Phase 2: Check schema files for FK violations (inline + ALTER TABLE).
+	for ctxName, ctxCfg := range cfg.Contexts {
+		files, err := ResolveSQLFiles(root, ctxCfg.Schema)
+		if err != nil {
+			// Already reported in phase 1.
+			continue
+		}
+		sv, se := CheckSchemaFiles(files, ctxName, idx)
+		result.SchemaViolations = append(result.SchemaViolations, sv...)
+		result.Errors = append(result.Errors, se...)
+	}
+
+	// Phase 3: Check query files for cross-BC table references.
+	for ctxName, ctxCfg := range cfg.Contexts {
+		if ctxCfg.Queries == "" {
+			continue
+		}
+		files, err := ResolveSQLFiles(root, ctxCfg.Queries)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Errorf("context %q queries: %w", ctxName, err))
+			continue
+		}
+		qv, qe := CheckQueryFiles(files, ctxName, idx)
+		result.QueryViolations = append(result.QueryViolations, qv...)
+		result.Errors = append(result.Errors, qe...)
+	}
 
 	return result
 }

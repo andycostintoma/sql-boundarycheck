@@ -31,21 +31,61 @@ func (v SchemaViolation) String() string {
 	)
 }
 
-// CheckSchema parses all .sql files in schemaDir and reports cross-BC foreign keys.
-func CheckSchema(schemaDir string, idx TableIndex) ([]SchemaViolation, []error) {
-	files, err := filepath.Glob(filepath.Join(schemaDir, "*.sql"))
-	if err != nil {
-		return nil, []error{fmt.Errorf("listing schema files: %w", err)}
+// DiscoverTables parses schema files and registers all CREATE TABLE declarations
+// in the table index under the given context name.
+func DiscoverTables(files []string, context string, idx TableIndex) []error {
+	var errs []error
+	for _, file := range files {
+		e := discoverTablesInFile(file, context, idx)
+		errs = append(errs, e...)
 	}
-	if len(files) == 0 {
-		return nil, []error{fmt.Errorf("no .sql files found in %s", schemaDir)}
+	return errs
+}
+
+func discoverTablesInFile(file string, context string, idx TableIndex) []error {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return []error{fmt.Errorf("reading %s: %w", file, err)}
 	}
 
+	result, err := pg_query.Parse(string(data))
+	if err != nil {
+		return []error{fmt.Errorf("parsing %s: %w", file, err)}
+	}
+
+	var errs []error
+	for _, stmt := range result.Stmts {
+		node := stmt.GetStmt()
+		if node == nil {
+			continue
+		}
+
+		create := node.GetCreateStmt()
+		if create == nil || create.Relation == nil {
+			continue
+		}
+
+		tableName := create.Relation.Relname
+		if tableName == "" {
+			continue
+		}
+
+		if err := idx.Register(tableName, context); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", filepath.Base(file), err))
+		}
+	}
+
+	return errs
+}
+
+// CheckSchemaFiles parses the given schema files and reports cross-BC foreign keys.
+// It checks both inline FK constraints in CREATE TABLE and ALTER TABLE ... ADD CONSTRAINT/FOREIGN KEY.
+func CheckSchemaFiles(files []string, context string, idx TableIndex) ([]SchemaViolation, []error) {
 	var violations []SchemaViolation
 	var errs []error
 
 	for _, file := range files {
-		v, e := checkSchemaFile(file, idx)
+		v, e := checkSchemaFile(file, context, idx)
 		violations = append(violations, v...)
 		errs = append(errs, e...)
 	}
@@ -53,7 +93,7 @@ func CheckSchema(schemaDir string, idx TableIndex) ([]SchemaViolation, []error) 
 	return violations, errs
 }
 
-func checkSchemaFile(file string, idx TableIndex) ([]SchemaViolation, []error) {
+func checkSchemaFile(file string, context string, idx TableIndex) ([]SchemaViolation, []error) {
 	data, err := os.ReadFile(file)
 	if err != nil {
 		return nil, []error{fmt.Errorf("reading %s: %w", file, err)}
@@ -75,67 +115,113 @@ func checkSchemaFile(file string, idx TableIndex) ([]SchemaViolation, []error) {
 			continue
 		}
 
-		create := node.GetCreateStmt()
-		if create == nil {
+		// Check CREATE TABLE inline FKs.
+		if create := node.GetCreateStmt(); create != nil {
+			v, e := checkCreateStmt(create, relFile, context, idx)
+			violations = append(violations, v...)
+			errs = append(errs, e...)
+		}
+
+		// Check ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY / ADD FOREIGN KEY.
+		if alter := node.GetAlterTableStmt(); alter != nil {
+			v, e := checkAlterTableStmt(alter, relFile, idx)
+			violations = append(violations, v...)
+			errs = append(errs, e...)
+		}
+	}
+
+	return violations, errs
+}
+
+func checkCreateStmt(create *pg_query.CreateStmt, relFile, context string, idx TableIndex) ([]SchemaViolation, []error) {
+	sourceTable := ""
+	if create.Relation != nil {
+		sourceTable = create.Relation.Relname
+	}
+	if sourceTable == "" {
+		return nil, nil
+	}
+
+	sourceCtx, sourceOk := idx.OwnerOf(sourceTable)
+	if !sourceOk {
+		return nil, []error{fmt.Errorf("%s: table %q not found in any context schema", relFile, sourceTable)}
+	}
+
+	jsonBytes, err := json.Marshal(create)
+	if err != nil {
+		return nil, []error{fmt.Errorf("%s: marshaling %s AST: %w", relFile, sourceTable, err)}
+	}
+
+	var tree interface{}
+	if err := json.Unmarshal(jsonBytes, &tree); err != nil {
+		return nil, []error{fmt.Errorf("%s: unmarshaling %s AST: %w", relFile, sourceTable, err)}
+	}
+
+	fks := collectForeignKeys(tree)
+	return evaluateFKs(fks, sourceTable, sourceCtx, relFile, idx)
+}
+
+func checkAlterTableStmt(alter *pg_query.AlterTableStmt, relFile string, idx TableIndex) ([]SchemaViolation, []error) {
+	if alter.Relation == nil {
+		return nil, nil
+	}
+
+	sourceTable := alter.Relation.Relname
+	if sourceTable == "" {
+		return nil, nil
+	}
+
+	sourceCtx, sourceOk := idx.OwnerOf(sourceTable)
+	if !sourceOk {
+		// Table might not be in this project's ownership — report as error.
+		return nil, []error{fmt.Errorf("%s: ALTER TABLE on %q which is not found in any context schema", relFile, sourceTable)}
+	}
+
+	// Marshal each ALTER TABLE command to JSON and look for FK constraints.
+	jsonBytes, err := json.Marshal(alter)
+	if err != nil {
+		return nil, []error{fmt.Errorf("%s: marshaling ALTER TABLE %s AST: %w", relFile, sourceTable, err)}
+	}
+
+	var tree interface{}
+	if err := json.Unmarshal(jsonBytes, &tree); err != nil {
+		return nil, []error{fmt.Errorf("%s: unmarshaling ALTER TABLE %s AST: %w", relFile, sourceTable, err)}
+	}
+
+	fks := collectForeignKeys(tree)
+	return evaluateFKs(fks, sourceTable, sourceCtx, relFile, idx)
+}
+
+func evaluateFKs(fks []foreignKeyRef, sourceTable, sourceCtx, relFile string, idx TableIndex) ([]SchemaViolation, []error) {
+	var violations []SchemaViolation
+	var errs []error
+
+	for _, fk := range fks {
+		targetCtx, targetOk := idx.OwnerOf(fk.targetTable)
+		if !targetOk {
+			errs = append(errs, fmt.Errorf(
+				"%s: FK target table %q (from %s) not found in any context schema",
+				relFile, fk.targetTable, sourceTable,
+			))
 			continue
 		}
 
-		sourceTable := ""
-		if create.Relation != nil {
-			sourceTable = create.Relation.Relname
-		}
-		if sourceTable == "" {
+		if sourceCtx == targetCtx || idx.IsShared(fk.targetTable) {
 			continue
 		}
 
-		sourceCtx, sourceOk := idx.OwnerOf(sourceTable)
-		if !sourceOk {
-			errs = append(errs, fmt.Errorf("%s: table %q is not declared in table_ownership", relFile, sourceTable))
+		if strings.EqualFold(sourceCtx, "shared") {
 			continue
 		}
 
-		// Marshal the entire CREATE TABLE to JSON so we can recursively
-		// find all Constraint nodes with contype=CONSTR_FOREIGN.
-		jsonBytes, err := json.Marshal(create)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: marshaling %s AST: %w", relFile, sourceTable, err))
-			continue
-		}
-
-		var tree interface{}
-		if err := json.Unmarshal(jsonBytes, &tree); err != nil {
-			errs = append(errs, fmt.Errorf("%s: unmarshaling %s AST: %w", relFile, sourceTable, err))
-			continue
-		}
-
-		fks := collectForeignKeys(tree)
-		for _, fk := range fks {
-			targetCtx, targetOk := idx.OwnerOf(fk.targetTable)
-			if !targetOk {
-				errs = append(errs, fmt.Errorf(
-					"%s: FK target table %q (from %s) is not declared in table_ownership",
-					relFile, fk.targetTable, sourceTable,
-				))
-				continue
-			}
-
-			if sourceCtx == targetCtx || idx.IsShared(fk.targetTable) {
-				continue
-			}
-
-			if strings.EqualFold(sourceCtx, "shared") {
-				continue
-			}
-
-			violations = append(violations, SchemaViolation{
-				File:           relFile,
-				SourceTable:    sourceTable,
-				SourceContext:  sourceCtx,
-				TargetTable:    fk.targetTable,
-				TargetContext:  targetCtx,
-				ConstraintName: fk.name,
-			})
-		}
+		violations = append(violations, SchemaViolation{
+			File:           relFile,
+			SourceTable:    sourceTable,
+			SourceContext:  sourceCtx,
+			TargetTable:    fk.targetTable,
+			TargetContext:  targetCtx,
+			ConstraintName: fk.name,
+		})
 	}
 
 	return violations, errs
@@ -153,7 +239,6 @@ func collectForeignKeys(node interface{}) []foreignKeyRef {
 
 	switch v := node.(type) {
 	case map[string]interface{}:
-		// Check if this is a Constraint node with CONSTR_FOREIGN (contype=10).
 		if contype, ok := v["contype"]; ok {
 			if ct, ok := toFloat(contype); ok && ct == 10 {
 				fk := foreignKeyRef{}
@@ -170,7 +255,6 @@ func collectForeignKeys(node interface{}) []foreignKeyRef {
 				}
 			}
 		}
-		// Recurse into all values.
 		for _, val := range v {
 			refs = append(refs, collectForeignKeys(val)...)
 		}

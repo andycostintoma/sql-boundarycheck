@@ -1,5 +1,5 @@
 -- name: CTECrossBC :many
--- Cross-BC via CTE: cte_cross context touches patients (patient) and appointments (appointment).
+-- Cross-BC via CTE: cte_test context touches patients (patient) and appointments (appointment).
 WITH patient_appts AS (
     SELECT a.appointment_id, p.patient_id
     FROM patients p

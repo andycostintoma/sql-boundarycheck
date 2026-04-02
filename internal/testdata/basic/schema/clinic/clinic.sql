@@ -1,4 +1,3 @@
--- Same-context FK: clinic_services -> clinics (both "clinic" context).
 CREATE TABLE clinics (
     clinic_id UUID PRIMARY KEY
 );

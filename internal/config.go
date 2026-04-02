@@ -4,16 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+// ContextConfig describes the schema and query locations for a single bounded context.
+type ContextConfig struct {
+	Schema  string `yaml:"schema"`
+	Queries string `yaml:"queries"`
+}
+
 // Config represents the .sqlboundarycheck.yaml configuration.
 type Config struct {
-	SchemaDir      string              `yaml:"schema_dir"`
-	QueriesDir     string              `yaml:"queries_dir"`
-	TableOwnership map[string][]string `yaml:"table_ownership"`
+	Contexts map[string]ContextConfig `yaml:"contexts"`
 }
 
 // LoadConfig reads and parses the YAML config file.
@@ -28,40 +31,61 @@ func LoadConfig(path string) (Config, error) {
 		return Config{}, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
-	if cfg.SchemaDir == "" {
-		return Config{}, fmt.Errorf("config %s: schema_dir is required", path)
+	if len(cfg.Contexts) == 0 {
+		return Config{}, fmt.Errorf("config %s: contexts must define at least one entry", path)
 	}
-	if cfg.QueriesDir == "" {
-		return Config{}, fmt.Errorf("config %s: queries_dir is required", path)
-	}
-	if len(cfg.TableOwnership) == 0 {
-		return Config{}, fmt.Errorf("config %s: table_ownership must define at least one context", path)
+
+	for name, ctx := range cfg.Contexts {
+		if ctx.Schema == "" {
+			return Config{}, fmt.Errorf("config %s: context %q must have a schema path", path, name)
+		}
 	}
 
 	return cfg, nil
 }
 
-// TableIndex maps every declared table to its owning context.
-type TableIndex struct {
-	owners map[string]string // table_name -> context
+// ResolveSQLFiles resolves a path that may be a single .sql file or a directory
+// containing .sql files. Returns the list of absolute file paths.
+func ResolveSQLFiles(root, path string) ([]string, error) {
+	abs := filepath.Join(root, path)
+
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, fmt.Errorf("resolving %s: %w", path, err)
+	}
+
+	if !info.IsDir() {
+		return []string{abs}, nil
+	}
+
+	files, err := filepath.Glob(filepath.Join(abs, "*.sql"))
+	if err != nil {
+		return nil, fmt.Errorf("listing .sql files in %s: %w", path, err)
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .sql files found in %s", path)
+	}
+
+	return files, nil
 }
 
-// BuildTableIndex constructs a reverse lookup from the config.
-func BuildTableIndex(cfg Config) (TableIndex, error) {
-	idx := TableIndex{owners: make(map[string]string)}
-	for ctx, tables := range cfg.TableOwnership {
-		for _, t := range tables {
-			t = strings.TrimSpace(t)
-			if t == "" {
-				continue
-			}
-			if existing, ok := idx.owners[t]; ok {
-				return TableIndex{}, fmt.Errorf("table %q claimed by both %q and %q", t, existing, ctx)
-			}
-			idx.owners[t] = ctx
-		}
+// TableIndex maps every discovered table to its owning context.
+type TableIndex struct {
+	owners map[string]string
+}
+
+// NewTableIndex creates an empty table index.
+func NewTableIndex() TableIndex {
+	return TableIndex{owners: make(map[string]string)}
+}
+
+// Register adds a table to the index. Returns an error if the table is already owned.
+func (idx TableIndex) Register(table, context string) error {
+	if existing, ok := idx.owners[table]; ok {
+		return fmt.Errorf("table %q claimed by both %q and %q", table, existing, context)
 	}
-	return idx, nil
+	idx.owners[table] = context
+	return nil
 }
 
 // OwnerOf returns the owning context of a table and whether it was found.
@@ -73,12 +97,4 @@ func (idx TableIndex) OwnerOf(table string) (string, bool) {
 // IsShared returns true if the table belongs to the "shared" context.
 func (idx TableIndex) IsShared(table string) bool {
 	return idx.owners[table] == "shared"
-}
-
-// ContextFromFile derives the bounded-context name from a query filename.
-// "auth.sql" -> "auth", "clinic.sql" -> "clinic".
-func ContextFromFile(filename string) string {
-	base := filepath.Base(filename)
-	ext := filepath.Ext(base)
-	return strings.TrimSuffix(base, ext)
 }

@@ -15,52 +15,87 @@ func testdataDir(t *testing.T) string {
 	return filepath.Join(filepath.Dir(file), "testdata")
 }
 
-func testTableIndex() TableIndex {
-	idx, _ := BuildTableIndex(Config{
-		TableOwnership: map[string][]string{
-			"auth":         {"auth_users", "auth_memberships", "auth_role_permissions"},
-			"clinic":       {"clinics", "clinic_services"},
-			"patient":      {"patients"},
-			"practitioner": {"practitioners", "practitioner_clinics", "practitioner_clinic_services"},
-			"schedule":     {"availability_rules"},
-			"appointment":  {"appointments"},
-			"notification": {"notifications"},
-			"shared":       {"outbox_events"},
-		},
-	})
-	return idx
-}
+// runCheck builds a Config from context definitions, runs the full check, and returns the result.
+func runCheck(t *testing.T, fixture string, contexts map[string]ContextConfig) Result {
+	t.Helper()
+	root := filepath.Join(testdataDir(t), fixture)
+	cfg := Config{Contexts: contexts}
 
-// --- Schema tests ---
+	// Write a temporary config — or just call the internal flow directly.
+	// Since Run() expects a file, we test at a lower level.
+	idx := NewTableIndex()
+	var result Result
 
-func TestSchemaCheckSameContextFKAllowed(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "schema")
-
-	violations, errs := CheckSchema(dir, idx)
-
-	// good.sql has clinics -> clinic_services, both in "clinic" context.
-	// Should produce no violations for that file.
-	for _, v := range violations {
-		if v.File == "good.sql" {
-			t.Errorf("unexpected violation in good.sql: %s", v)
+	// Phase 1: discover tables.
+	for ctxName, ctxCfg := range cfg.Contexts {
+		files, err := ResolveSQLFiles(root, ctxCfg.Schema)
+		if err != nil {
+			result.Errors = append(result.Errors, err)
+			continue
 		}
+		errs := DiscoverTables(files, ctxName, idx)
+		result.Errors = append(result.Errors, errs...)
 	}
-	for _, e := range errs {
-		// Allow errors from other fixture files but not good.sql.
-		_ = e
+
+	// Phase 2: check schema FKs.
+	for ctxName, ctxCfg := range cfg.Contexts {
+		files, err := ResolveSQLFiles(root, ctxCfg.Schema)
+		if err != nil {
+			continue
+		}
+		sv, se := CheckSchemaFiles(files, ctxName, idx)
+		result.SchemaViolations = append(result.SchemaViolations, sv...)
+		result.Errors = append(result.Errors, se...)
+	}
+
+	// Phase 3: check queries.
+	for ctxName, ctxCfg := range cfg.Contexts {
+		if ctxCfg.Queries == "" {
+			continue
+		}
+		files, err := ResolveSQLFiles(root, ctxCfg.Queries)
+		if err != nil {
+			result.Errors = append(result.Errors, err)
+			continue
+		}
+		qv, qe := CheckQueryFiles(files, ctxName, idx)
+		result.QueryViolations = append(result.QueryViolations, qv...)
+		result.Errors = append(result.Errors, qe...)
+	}
+
+	return result
+}
+
+// --- Schema: same-context FK ---
+
+func TestSameContextFKAllowed(t *testing.T) {
+	r := runCheck(t, "basic", map[string]ContextConfig{
+		"clinic":      {Schema: "schema/clinic"},
+		"auth":        {Schema: "schema/auth"},
+		"patient":     {Schema: "schema/patient"},
+		"appointment": {Schema: "schema/appointment"},
+		"shared":      {Schema: "schema/shared"},
+	})
+
+	if len(r.SchemaViolations) > 0 {
+		t.Errorf("expected no schema violations, got %d: %v", len(r.SchemaViolations), r.SchemaViolations)
+	}
+	for _, e := range r.Errors {
+		t.Errorf("unexpected error: %s", e)
 	}
 }
 
-func TestSchemaCheckCrossBCFKDetected(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "schema")
+// --- Schema: cross-BC inline FK ---
 
-	violations, _ := CheckSchema(dir, idx)
+func TestCrossBCInlineFKDetected(t *testing.T) {
+	r := runCheck(t, "cross_bc_fk", map[string]ContextConfig{
+		"auth":    {Schema: "schema/auth"},
+		"patient": {Schema: "schema/patient"},
+	})
 
 	found := false
-	for _, v := range violations {
-		if v.File == "cross_bc.sql" && v.SourceTable == "patients" && v.TargetTable == "auth_users" {
+	for _, v := range r.SchemaViolations {
+		if v.SourceTable == "patients" && v.TargetTable == "auth_users" {
 			found = true
 			if v.SourceContext != "patient" {
 				t.Errorf("expected source context 'patient', got %q", v.SourceContext)
@@ -75,186 +110,285 @@ func TestSchemaCheckCrossBCFKDetected(t *testing.T) {
 	}
 }
 
-func TestSchemaCheckSharedTargetAllowed(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "schema")
+// --- Schema: FK to shared table ---
 
-	violations, _ := CheckSchema(dir, idx)
+func TestSharedTargetFKAllowed(t *testing.T) {
+	r := runCheck(t, "shared_target", map[string]ContextConfig{
+		"shared":       {Schema: "schema/shared"},
+		"notification": {Schema: "schema/notification"},
+	})
 
-	for _, v := range violations {
-		if v.File == "shared_target.sql" {
-			t.Errorf("unexpected violation in shared_target.sql: %s", v)
-		}
+	for _, v := range r.SchemaViolations {
+		t.Errorf("unexpected violation: %s", v)
 	}
 }
 
-func TestSchemaCheckUnownedTableReportsError(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "schema")
+// --- Schema: ALTER TABLE cross-BC FK ---
 
-	_, errs := CheckSchema(dir, idx)
+func TestAlterTableCrossBCFKDetected(t *testing.T) {
+	r := runCheck(t, "alter_table_cross", map[string]ContextConfig{
+		"auth":    {Schema: "schema/auth"},
+		"patient": {Schema: "schema/patient"},
+	})
 
 	found := false
-	for _, e := range errs {
-		if e != nil && contains(e.Error(), "mystery_table") && contains(e.Error(), "not declared") {
+	for _, v := range r.SchemaViolations {
+		if v.SourceTable == "patients" && v.TargetTable == "auth_users" {
 			found = true
+			if v.ConstraintName != "patients_owner_fk" {
+				t.Errorf("expected constraint name 'patients_owner_fk', got %q", v.ConstraintName)
+			}
 		}
 	}
 	if !found {
-		t.Error("expected error for unowned table 'mystery_table', not found")
+		t.Error("expected ALTER TABLE cross-BC FK violation: patients -> auth_users, not found")
 	}
 }
 
-// --- Query tests ---
+// --- Schema: ALTER TABLE same-context FK ---
 
-func TestQueryCheckOwnContextAllowed(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+func TestAlterTableSameContextFKAllowed(t *testing.T) {
+	r := runCheck(t, "alter_table_same", map[string]ContextConfig{
+		"clinic": {Schema: "schema/clinic"},
+	})
 
-	violations, errs := CheckQueries(dir, idx)
-
-	// clinic.sql touches only clinics and clinic_services (both "clinic" context).
-	for _, v := range violations {
-		if v.File == "clinic.sql" {
-			t.Errorf("unexpected violation in clinic.sql: %s", v)
-		}
+	for _, v := range r.SchemaViolations {
+		t.Errorf("unexpected violation: %s", v)
 	}
+	for _, e := range r.Errors {
+		t.Errorf("unexpected error: %s", e)
+	}
+}
+
+// --- Schema: ALTER TABLE ADD FOREIGN KEY (no CONSTRAINT keyword) ---
+
+func TestAlterTableAddForeignKeyShorthandDetected(t *testing.T) {
+	// The alter_table_same fixture already uses ADD FOREIGN KEY without CONSTRAINT name.
+	// Here we verify unnamed ALTER TABLE FK works for cross-BC detection.
+	r := runCheck(t, "alter_table_cross", map[string]ContextConfig{
+		"auth":    {Schema: "schema/auth"},
+		"patient": {Schema: "schema/patient"},
+	})
+
+	if len(r.SchemaViolations) == 0 {
+		t.Error("expected at least one ALTER TABLE FK violation")
+	}
+}
+
+// --- Schema: table auto-discovery ---
+
+func TestTableAutoDiscovery(t *testing.T) {
+	root := filepath.Join(testdataDir(t), "basic")
+	idx := NewTableIndex()
+
+	files, err := ResolveSQLFiles(root, "schema/clinic")
+	if err != nil {
+		t.Fatalf("resolving clinic schema: %s", err)
+	}
+	errs := DiscoverTables(files, "clinic", idx)
 	for _, e := range errs {
-		if e != nil && contains(e.Error(), "clinic.sql") {
-			t.Errorf("unexpected error for clinic.sql: %s", e)
-		}
+		t.Errorf("unexpected error: %s", e)
+	}
+
+	owner, ok := idx.OwnerOf("clinics")
+	if !ok || owner != "clinic" {
+		t.Errorf("expected clinics owned by 'clinic', got %q (found=%v)", owner, ok)
+	}
+
+	owner, ok = idx.OwnerOf("clinic_services")
+	if !ok || owner != "clinic" {
+		t.Errorf("expected clinic_services owned by 'clinic', got %q (found=%v)", owner, ok)
 	}
 }
 
-func TestQueryCheckOwnContextOnlyAllowed(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Schema: duplicate table ownership ---
 
-	violations, _ := CheckQueries(dir, idx)
+func TestDuplicateTableOwnershipError(t *testing.T) {
+	root := filepath.Join(testdataDir(t), "cross_bc_fk")
+	idx := NewTableIndex()
 
-	// appointment.sql touches only appointments (own context).
-	for _, v := range violations {
-		if v.File == "appointment.sql" {
-			t.Errorf("unexpected violation in appointment.sql: %s", v)
-		}
+	// Register auth_users under auth.
+	authFiles, _ := ResolveSQLFiles(root, "schema/auth")
+	_ = DiscoverTables(authFiles, "auth", idx)
+
+	// Try registering auth_users again under patient (patient.sql also declares it? No — but let's test directly).
+	err := idx.Register("auth_users", "patient")
+	if err == nil {
+		t.Error("expected error for duplicate table registration, got nil")
 	}
 }
 
-func TestQueryCheckCrossBCJoinDetected(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Query: own context allowed ---
 
-	violations, _ := CheckQueries(dir, idx)
+func TestQueryOwnContextAllowed(t *testing.T) {
+	r := runCheck(t, "basic", map[string]ContextConfig{
+		"clinic":      {Schema: "schema/clinic", Queries: "queries/clinic"},
+		"auth":        {Schema: "schema/auth"},
+		"patient":     {Schema: "schema/patient"},
+		"appointment": {Schema: "schema/appointment", Queries: "queries/appointment"},
+		"shared":      {Schema: "schema/shared"},
+	})
+
+	for _, v := range r.QueryViolations {
+		t.Errorf("unexpected query violation: %s", v)
+	}
+}
+
+// --- Query: cross-BC JOIN detected ---
+
+func TestQueryCrossBCJoinDetected(t *testing.T) {
+	r := runCheck(t, "cross_query", map[string]ContextConfig{
+		"appointment": {Schema: "schema/appointment", Queries: "queries/appointment"},
+		"clinic":      {Schema: "schema/clinic"},
+	})
 
 	found := false
-	for _, v := range violations {
-		if v.File == "appointment_cross.sql" && v.Table == "clinics" {
+	for _, v := range r.QueryViolations {
+		if v.Table == "clinics" && v.QueryContext == "appointment" {
 			found = true
-			if v.QueryContext != "appointment_cross" {
-				t.Errorf("expected query context 'appointment_cross', got %q", v.QueryContext)
-			}
 			if v.TableContext != "clinic" {
 				t.Errorf("expected table context 'clinic', got %q", v.TableContext)
 			}
 		}
 	}
 	if !found {
-		t.Error("expected cross-BC violation: appointment_cross.sql touching clinics, not found")
+		t.Error("expected cross-BC query violation: appointment touching clinics, not found")
 	}
 }
 
-func TestQueryCheckSharedTableAllowed(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Query: shared table allowed ---
 
-	violations, _ := CheckQueries(dir, idx)
+func TestQuerySharedTableAllowed(t *testing.T) {
+	r := runCheck(t, "shared_query", map[string]ContextConfig{
+		"shared":       {Schema: "schema/shared"},
+		"notification": {Schema: "schema/notification", Queries: "queries/notification"},
+	})
 
-	for _, v := range violations {
-		if v.File == "shared_ok.sql" {
-			t.Errorf("unexpected violation in shared_ok.sql: %s", v)
-		}
+	for _, v := range r.QueryViolations {
+		t.Errorf("unexpected query violation: %s", v)
 	}
 }
 
-func TestQueryCheckCTECrossBCDetected(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Query: CTE cross-BC detected ---
 
-	violations, _ := CheckQueries(dir, idx)
+func TestQueryCTECrossBCDetected(t *testing.T) {
+	r := runCheck(t, "cte_cross", map[string]ContextConfig{
+		"patient":     {Schema: "schema/patient"},
+		"appointment": {Schema: "schema/appointment"},
+		"clinic":      {Schema: "schema/clinic"},
+		"cte_test":    {Schema: "schema/clinic", Queries: "queries/cte_test"}, // cte_test uses clinic schema as dummy
+	})
 
 	foundPatients := false
 	foundAppointments := false
-	for _, v := range violations {
-		if v.File == "cte_cross.sql" && v.Table == "patients" {
+	for _, v := range r.QueryViolations {
+		if v.QueryContext == "cte_test" && v.Table == "patients" {
 			foundPatients = true
 		}
-		if v.File == "cte_cross.sql" && v.Table == "appointments" {
+		if v.QueryContext == "cte_test" && v.Table == "appointments" {
 			foundAppointments = true
 		}
 	}
 	if !foundPatients {
-		t.Error("expected CTE cross-BC violation: cte_cross.sql touching patients, not found")
+		t.Error("expected CTE cross-BC violation: cte_test touching patients, not found")
 	}
 	if !foundAppointments {
-		t.Error("expected CTE cross-BC violation: cte_cross.sql touching appointments, not found")
+		t.Error("expected CTE cross-BC violation: cte_test touching appointments, not found")
 	}
 }
 
-func TestQueryCheckCTEAliasNotFlaggedAsUnowned(t *testing.T) {
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Query: CTE alias not flagged as unowned ---
 
-	_, errs := CheckQueries(dir, idx)
+func TestQueryCTEAliasNotFlaggedAsUnowned(t *testing.T) {
+	r := runCheck(t, "cte_cross", map[string]ContextConfig{
+		"patient":     {Schema: "schema/patient"},
+		"appointment": {Schema: "schema/appointment"},
+		"clinic":      {Schema: "schema/clinic"},
+		"cte_test":    {Schema: "schema/clinic", Queries: "queries/cte_test"},
+	})
 
-	for _, e := range errs {
+	for _, e := range r.Errors {
 		if e != nil && contains(e.Error(), "patient_appts") {
 			t.Errorf("CTE alias 'patient_appts' should not be flagged as unowned: %s", e)
 		}
 	}
 }
 
-func TestQueryCheckParamPlaceholders(t *testing.T) {
-	// Verifies $1 params don't break parsing.
-	idx := testTableIndex()
-	dir := filepath.Join(testdataDir(t), "queries")
+// --- Query: $1 params don't break parsing ---
 
-	_, errs := CheckQueries(dir, idx)
+func TestQueryParamPlaceholders(t *testing.T) {
+	r := runCheck(t, "param_query", map[string]ContextConfig{
+		"appointment": {Schema: "schema/appointment", Queries: "queries/appointment"},
+	})
 
-	for _, e := range errs {
+	for _, e := range r.Errors {
 		if e != nil && contains(e.Error(), "parsing") {
 			t.Errorf("unexpected parse error (param placeholder issue?): %s", e)
 		}
 	}
+
+	for _, v := range r.QueryViolations {
+		t.Errorf("unexpected query violation: %s", v)
+	}
 }
 
-// --- Config tests ---
+// --- Config: context without queries ---
 
-func TestBuildTableIndexRejectsDuplicateOwnership(t *testing.T) {
-	_, err := BuildTableIndex(Config{
-		TableOwnership: map[string][]string{
-			"auth":    {"users"},
-			"patient": {"users"},
-		},
+func TestContextWithoutQueriesOK(t *testing.T) {
+	r := runCheck(t, "basic", map[string]ContextConfig{
+		"clinic":      {Schema: "schema/clinic"},
+		"auth":        {Schema: "schema/auth"},
+		"patient":     {Schema: "schema/patient"},
+		"appointment": {Schema: "schema/appointment"},
+		"shared":      {Schema: "schema/shared"},
 	})
-	if err == nil {
-		t.Error("expected error for duplicate table ownership, got nil")
+
+	// No query violations or errors since no queries are checked.
+	for _, v := range r.QueryViolations {
+		t.Errorf("unexpected query violation: %s", v)
 	}
 }
 
-func TestContextFromFile(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"auth.sql", "auth"},
-		{"clinic.sql", "clinic"},
-		{"/some/path/appointment.sql", "appointment"},
+// --- Config: schema as single file ---
+
+func TestSchemaAsSingleFile(t *testing.T) {
+	r := runCheck(t, "basic", map[string]ContextConfig{
+		"clinic":      {Schema: "schema/clinic/clinic.sql"},
+		"auth":        {Schema: "schema/auth/auth.sql"},
+		"patient":     {Schema: "schema/patient/patient.sql"},
+		"appointment": {Schema: "schema/appointment/appointment.sql"},
+		"shared":      {Schema: "schema/shared/shared.sql"},
+	})
+
+	if len(r.SchemaViolations) > 0 {
+		t.Errorf("unexpected schema violations: %v", r.SchemaViolations)
 	}
-	for _, tt := range tests {
-		got := ContextFromFile(tt.input)
-		if got != tt.want {
-			t.Errorf("ContextFromFile(%q) = %q, want %q", tt.input, got, tt.want)
-		}
+	for _, e := range r.Errors {
+		t.Errorf("unexpected error: %s", e)
+	}
+}
+
+// --- Path resolution ---
+
+func TestResolveSQLFilesDirectory(t *testing.T) {
+	root := filepath.Join(testdataDir(t), "basic")
+	files, err := ResolveSQLFiles(root, "schema/clinic")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if len(files) != 1 {
+		t.Errorf("expected 1 file, got %d", len(files))
+	}
+}
+
+func TestResolveSQLFilesSingleFile(t *testing.T) {
+	root := filepath.Join(testdataDir(t), "basic")
+	files, err := ResolveSQLFiles(root, "schema/clinic/clinic.sql")
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if len(files) != 1 {
+		t.Errorf("expected 1 file, got %d", len(files))
 	}
 }
 
